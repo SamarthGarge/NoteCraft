@@ -5,8 +5,6 @@ a clean checklist of action items — each with a detected **owner**,
 **deadline**, and **confidence score** — using classical rule-based NLP
 (no LLMs, no paid APIs, no model training).
 
-Built as a portfolio project. See `PRD.MD` and `TRD.MD` for the full
-product/technical spec this implementation follows.
 
 ## Features
 
