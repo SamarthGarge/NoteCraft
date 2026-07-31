@@ -33,14 +33,34 @@ _MODEL_NAME = "en_core_web_sm"
 
 
 def _load_spacy_model():
-    """Load the spaCy English model, downloading it if it's missing."""
+    """Load the spaCy English model.
+
+    Locally (or anywhere the environment is writable), this will
+    auto-download the model on first run if it's missing. On hosts like
+    Streamlit Community Cloud, the environment is locked read-only right
+    after the build step, so a runtime download would fail with a
+    PermissionError -- in that case we raise a clear, actionable error
+    instead of retrying forever. The real fix for those hosts is to make
+    sure the model is listed in requirements.txt so it installs during
+    the build step, before the environment gets locked.
+    """
     try:
         return spacy.load(_MODEL_NAME)
     except OSError:
-        from spacy.cli import download as spacy_download
+        try:
+            from spacy.cli import download as spacy_download
 
-        spacy_download(_MODEL_NAME)
-        return spacy.load(_MODEL_NAME)
+            spacy_download(_MODEL_NAME)
+            return spacy.load(_MODEL_NAME)
+        except (OSError, PermissionError) as exc:
+            raise RuntimeError(
+                f"Could not load or download the '{_MODEL_NAME}' spaCy model, "
+                "and this environment doesn't allow installing it at runtime. "
+                "Make sure it's listed in requirements.txt, e.g.:\n"
+                f"en_core_web_sm @ https://github.com/explosion/spacy-models/"
+                f"releases/download/en_core_web_sm-3.8.0/"
+                f"en_core_web_sm-3.8.0-py3-none-any.whl"
+            ) from exc
 
 
 nlp = _load_spacy_model()
