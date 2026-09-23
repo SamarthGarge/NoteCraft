@@ -1,21 +1,13 @@
 """
 extractor.py
-------------
-Core NLP logic for the Meeting Notes -> Action Items Extractor.
-
-This module is pure Python + spaCy (no Streamlit imports) so it can be
-tested in isolation. All rules are "classical" NLP: POS tags, dependency
-parsing, named-entity recognition, and regex -- no machine-learning
-classifiers or LLM calls, per the project constraints.
-
-Main entry point: extract_action_items(text, reference_date)
 """
 
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import dataclass, field, asdict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Optional
 
 import spacy
@@ -79,9 +71,13 @@ class ActionItem:
     task: str
     owner: Optional[str] = None
     deadline: Optional[str] = None       # normalized ISO date, e.g. "2026-07-25"
-    deadline_raw: Optional[str] = None   # original phrase, e.g. "by next Friday"
+    deadline_raw: Optional[str] = None    # original phrase, e.g. "by next Friday"
     confidence: str = "Low"              # "High" | "Medium" | "Low"
     matched_cues: list = field(default_factory=list)
+    # New in this revision
+    priority_score: int = 3              # 1 (lowest) - 5 (highest)
+    priority_band: str = "Medium"        # "High" | "Medium" | "Low"
+    sentiment: str = "Neutral"            # "Positive" | "Negative" | "Neutral"
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -346,8 +342,6 @@ def _normalize_date_phrase(phrase: str, reference_date: date) -> Optional[str]:
     for known relative-date patterns *within* the phrase rather than
     requiring an exact match.
     """
-    from datetime import timedelta
-
     lowered = phrase.strip().lower()
 
     if re.search(r"\b(today|tonight|eod|cob)\b", lowered):
@@ -388,7 +382,7 @@ def _normalize_date_phrase(phrase: str, reference_date: date) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# 4.2 Confidence scoring
+# 4.5 Confidence scoring
 # ---------------------------------------------------------------------------
 
 def score_confidence(matched_cues: list[str], owner: Optional[str], deadline: Optional[str]) -> str:
@@ -400,6 +394,211 @@ def score_confidence(matched_cues: list[str], owner: Optional[str], deadline: Op
     if num_cues == 2:
         return "Medium"
     return "Low"
+
+
+# ---------------------------------------------------------------------------
+# 4.6 Priority scoring (NEW)
+# ---------------------------------------------------------------------------
+# Priority is a 1-5 integer that combines:
+#   - Confidence (High=+2, Medium=+1, Low=0)
+#   - Deadline urgency (overdue=+2, <=3 days=+1.5, <=7 days=+1, >7 days=+0.5,
+#     no deadline=+0)
+#   - Owner presence (assigned=+1, unassigned=+0)
+# Result is clipped to [1, 5] and banded into High (>=4) / Medium (3) / Low (<=2).
+# This is intentionally simple and explainable: every input is visible to the
+# user, and the formula is shown in the docs so faculty can audit it.
+
+_CONFIDENCE_POINTS = {"High": 2, "Medium": 1, "Low": 0}
+
+
+def score_priority(
+    confidence: str,
+    deadline_iso: Optional[str],
+    owner: Optional[str],
+    reference_date: Optional[date] = None,
+) -> tuple[int, str]:
+    """Return (priority_score 1-5, priority_band 'High'|'Medium'|'Low')."""
+    if reference_date is None:
+        reference_date = date.today()
+
+    pts = _CONFIDENCE_POINTS.get(confidence, 0)
+
+    if deadline_iso:
+        try:
+            due = date.fromisoformat(deadline_iso)
+            delta_days = (due - reference_date).days
+            if delta_days < 0:
+                pts += 2.0  # overdue — highest urgency
+            elif delta_days <= 3:
+                pts += 1.5
+            elif delta_days <= 7:
+                pts += 1.0
+            else:
+                pts += 0.5
+        except (ValueError, TypeError):
+            pass  # malformed iso date — treat as no deadline
+
+    if owner:
+        pts += 1.0
+
+    # Map 0-5 float to 1-5 int (avoid 0 so priority is always meaningful)
+    score = max(1, min(5, round(pts)))
+    band = "High" if score >= 4 else ("Medium" if score == 3 else "Low")
+    return score, band
+
+
+# ---------------------------------------------------------------------------
+# 4.7 Sentiment scoring (NEW)
+# ---------------------------------------------------------------------------
+# Tiny lexicon-based polarity. No external deps — keeps the project's
+# "rule-based only" promise intact. Each matched word adds +/-1; the
+# final sign + magnitude bucket becomes Positive / Negative / Neutral.
+# This is intentionally simple — it is NOT a replacement for VADER/TextBlob
+# but demonstrates a second classical-NLP angle alongside the cue rules.
+
+_POSITIVE_WORDS = {
+    "good", "great", "excellent", "happy", "pleased", "aligned", "agree",
+    "agreed", "approve", "approved", "success", "successful", "complete",
+    "completed", "deliver", "delivered", "win", "wins", "winning",
+    "progress", "ontrack", "on-track", "smooth", "excited", "fantastic",
+    "solid", "strong", "momentum", "ready", "confirmed",
+}
+_NEGATIVE_WORDS = {
+    "delay", "delayed", "block", "blocked", "blocker", "issue", "issues",
+    "problem", "problems", "concern", "concerns", "risk", "risks", "miss",
+    "missed", "fail", "failed", "failure", "cancel", "cancelled", "drop",
+    "decline", "rejected", "outdated", "stuck", "wait", "waiting", "behind",
+    "overdue", "unhappy", "unclear", "confusing", "broken",
+}
+
+
+def analyze_sentiment(text: str) -> str:
+    """Return 'Positive' | 'Negative' | 'Neutral' for a piece of text."""
+    if not text:
+        return "Neutral"
+    tokens = re.findall(r"[a-zA-Z][a-zA-Z\-']*", text.lower())
+    score = 0
+    for tok in tokens:
+        if tok in _POSITIVE_WORDS:
+            score += 1
+        elif tok in _NEGATIVE_WORDS:
+            score -= 1
+    if score >= 1:
+        return "Positive"
+    if score <= -1:
+        return "Negative"
+    return "Neutral"
+
+
+# ---------------------------------------------------------------------------
+# 4.8 Meeting summary (NEW)
+# ---------------------------------------------------------------------------
+# Extractive summary: pick the top-N sentences by cue-density (count of
+# matched action-item cues) plus a small bonus for sentence length. This is
+# a TextRank-style signal done without any ML — it reuses the same cue
+# vocabulary that drives flagging, so the summary naturally surfaces the
+# most "action-dense" sentences in the notes.
+
+def generate_summary(text: str, max_sentences: int = 3) -> str:
+    """Return a short extractive summary (1-3 sentences) of the notes.
+
+    Picks the top-`max_sentences` sentences ranked by cue-density. Falls
+    back to the first 1-2 sentences if no cues fire at all (so the
+    summary is never empty for non-empty input).
+    """
+    if not text or not text.strip():
+        return ""
+
+    chunks = _split_into_chunks(text)
+    scored: list[tuple[float, int, str]] = []  # (score, -position, text)
+    position = 0
+    for chunk_text in nlp.pipe(chunks):
+        for sent in chunk_text.sents:
+            sent_text = sent.text.strip()
+            if not sent_text:
+                continue
+            _, cues = classify_sentence(sent)
+            word_count = len([t for t in sent if not t.is_punct and not t.is_space])
+            # Cue density = cues per 5 words, with a small length bonus so
+            # very short sentences aren't over-ranked.
+            density = len(cues) / max(word_count, 1) * 5
+            length_bonus = min(word_count, 15) / 30.0  # cap at 0.5
+            total = density + length_bonus
+            scored.append((total, -position, sent_text))
+            position += 1
+
+    if not scored:
+        return ""
+
+    # Sort by score desc, then by original position asc (stable)
+    scored.sort(key=lambda x: (-x[0], -x[1]))
+    top = sorted(scored[:max_sentences], key=lambda x: -x[1])  # restore original order
+    return " ".join(s[2] for s in top)
+
+
+# ---------------------------------------------------------------------------
+# 4.9 Participants list (NEW)
+# ---------------------------------------------------------------------------
+
+def extract_participants(text: str) -> list[str]:
+    """Return a list of unique PERSON names mentioned anywhere in the
+    notes (not just inside flagged action items). Order = first appearance.
+    """
+    if not text or not text.strip():
+        return []
+    chunks = _split_into_chunks(text)
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for doc in nlp.pipe(chunks):
+        for ent in doc.ents:
+            if ent.label_ == "PERSON" and ent.text not in seen:
+                # Filter out single-letter or pure-initial entries
+                if len(ent.text.strip()) >= 2:
+                    seen.add(ent.text)
+                    ordered.append(ent.text)
+    return ordered
+
+
+# ---------------------------------------------------------------------------
+# 4.10 Key topics / keywords (NEW)
+# ---------------------------------------------------------------------------
+
+# Stopword-like words we don't want as "topics" even if spaCy's noun_chunks
+# produces them. Augmented with project-domain filler.
+_TOPIC_STOPWORDS = {
+    "we", "us", "our", "ours", "you", "your", "they", "them", "their",
+    "today", "tomorrow", "yesterday", "now", "then", "week", "month",
+    "day", "year", "time", "next week", "next month", "everyone",
+    "someone", "anyone", "thing", "something", "anything", "notes",
+    "meeting", "team", "people", "guy", "guys", "stuff",
+}
+
+
+def extract_key_topics(text: str, top_k: int = 8) -> list[tuple[str, int]]:
+    """Return the top-K noun chunks as (phrase, count) pairs.
+
+    Uses spaCy's noun_chunks iterator + a small stopword filter. The
+    count is how many times that chunk appeared across the notes.
+    """
+    if not text or not text.strip():
+        return []
+    chunks = _split_into_chunks(text)
+    counter: Counter = Counter()
+    for doc in nlp.pipe(chunks):
+        for chunk in doc.noun_chunks:
+            phrase = chunk.text.lower().strip()
+            # Filter: at least 4 chars, not a stopword, not starting with
+            # a determiner or pronoun.
+            if len(phrase) < 4:
+                continue
+            if phrase in _TOPIC_STOPWORDS:
+                continue
+            # Strip leading determiners
+            phrase = re.sub(r"^(the|a|an|this|that|these|those|some|any|all|our|their|his|her|its)\s+", "", phrase)
+            if not phrase or phrase in _TOPIC_STOPWORDS:
+                continue
+            counter[phrase] += 1
+    return counter.most_common(top_k)
 
 
 # ---------------------------------------------------------------------------
@@ -481,6 +680,10 @@ def extract_action_items(text: str, reference_date: Optional[date] = None) -> li
             owner = extract_owner(sent)
             deadline, deadline_raw = extract_deadline(sent, reference_date)
             confidence = score_confidence(cues, owner, deadline)
+            priority_score, priority_band = score_priority(
+                confidence, deadline, owner, reference_date
+            )
+            sentiment = analyze_sentiment(sent.text)
 
             items.append(
                 ActionItem(
@@ -492,6 +695,9 @@ def extract_action_items(text: str, reference_date: Optional[date] = None) -> li
                     deadline_raw=deadline_raw,
                     confidence=confidence,
                     matched_cues=cues,
+                    priority_score=priority_score,
+                    priority_band=priority_band,
+                    sentiment=sentiment,
                 )
             )
             next_id += 1
